@@ -2,16 +2,17 @@
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Net.Http;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
-using Microsoft.SemanticKernel.Connectors.Ollama; // Connects to your local Ollama runtime
+using Microsoft.SemanticKernel.Connectors.Ollama;
 
 await MainAsync(args);
 
 async Task MainAsync(string[] args)
 {
     string sheetId = Environment.GetEnvironmentVariable("SPREADSHEET_ID") ?? "1KsKmgmtiELtMvVFHkE9QLvt98Bb7LqJv_erA8OjTJJo";
-    bool mockMode = bool.TryParse(Environment.GetEnvironmentVariable("MOCK_MODE"), out var res) ? res : true;
+    bool mockMode = !bool.TryParse(Environment.GetEnvironmentVariable("MOCK_MODE"), out var res) || res;
 
     Console.WriteLine("============================================================");
     Console.WriteLine("          C# LOCAL OLLAMA WORKSHEET WORK IQ AGENT           ");
@@ -20,15 +21,21 @@ async Task MainAsync(string[] args)
     Console.WriteLine($"Connection Mode: {(mockMode ? "[MOCK MODE]" : "[LIVE GOOGLE SHEETS]")}");
     Console.WriteLine("============================================================");
 
-    // 1. Initialize the Local AI Kernel Brain (Using Phi-3 for speed on local CPU)
+    // 1. Initialize the Local AI Kernel Brain
     var builder = Kernel.CreateBuilder();
 
+    // Create custom HttpClient setting the BaseAddress as the endpoint and extending the timeout
+    var httpClient = new HttpClient
+    {
+        BaseAddress = new Uri("http://localhost:11434"),
+        Timeout = TimeSpan.FromMinutes(5) // Prevents the 100-second timeout exception
+    };
+
 #pragma warning disable SKEXP0070 
-builder.AddOllamaChatCompletion(
-    modelId: "llama3.1", // <-- Updated to target the newly pulled Llama 3.1 model
-    endpoint: new Uri("http://localhost:11434")
-);
-#pragma warning restore SKEXP0070
+    builder.AddOllamaChatCompletion(
+        modelId: "llama3.1",
+        httpClient: httpClient
+    );
 #pragma warning restore SKEXP0070
 
     var kernel = builder.Build();
@@ -36,6 +43,7 @@ builder.AddOllamaChatCompletion(
     // 2. Initialize layers and register DataLayer as an LLM Plugin
     var dataLayer = new DataLayer(sheetId, mockMode);
     var memoryLayer = new MemoryLayer();
+    
     kernel.ImportPluginFromObject(dataLayer, "GoogleSheetsPlugin");
 
     Console.WriteLine("[Agent] Local Brain initialized with Google Sheet Tools. Ask me anything!\n");
@@ -67,18 +75,21 @@ async Task<string> ProcessAgentQueryAsync(Kernel kernel, string query, MemoryLay
 {
     var chatService = kernel.GetRequiredService<IChatCompletionService>();
     
-    var history = new ChatHistory(@"You are an advanced Work IQ Data Agent. 
-You have access to live Google Sheet tools. Use them whenever the user asks for structural info, 
-tab lists, or row lookups. If the data is missing, state what tool you tried to use.");
+    // Optimized strict prompt variant to force local model compliance
+    var history = new ChatHistory(@"You are a strict data assistant for this specific Google Sheet. 
+
+Rules:
+1. ONLY answer questions using the data provided by your tools. Never use your internal general knowledge.
+2. If the user asks a general question or makes small talk (e.g., 'Hello', 'What is a mouse?'), you MUST bypass tools and reply exactly: 'I am only authorized to answer questions regarding your spreadsheet data.'
+3. If the user asks to look up an item but does not specify a tab, first call 'QuerySheetTabsAsync' to see what tabs exist, or ask the user which tab they want to search.");
 
     history.AddUserMessage(query);
 
-    // REPLACE WITH THIS:
     var settings = new OllamaPromptExecutionSettings 
     { 
         FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() 
     };
-    // The local model evaluates the query, invokes C# logic, and yields the response
+
     var result = await chatService.GetChatMessageContentAsync(history, settings, kernel);
     
     memory.LogAgentAction("Local LLM Inference", $"Processed query via native loop.");
@@ -96,7 +107,7 @@ public class DataLayer
     public async Task<List<string>> QuerySheetTabsAsync() 
     {
         Console.WriteLine("\n -> [Tool Triggered by Local LLM]: QuerySheetTabsAsync()");
-        return new() { "Sales", "Inventory", "Users" };
+        return await Task.FromResult(new List<string> { "Sales", "Inventory", "Users" });
     }
 
     [KernelFunction, Description("Searches a specific spreadsheet tab for rows matching a target item name.")]
@@ -108,9 +119,9 @@ public class DataLayer
         
         if (tabName.Equals("Inventory", StringComparison.OrdinalIgnoreCase) && keyword.Contains("mouse", StringComparison.OrdinalIgnoreCase))
         {
-            return "Item Found: Wireless Mouse | Stock: 45 units | Status: In Stock | Location: Aisle 4";
+            return await Task.FromResult("Item Found: Wireless Mouse | Stock: 45 units | Status: In Stock | Location: Aisle 4");
         }
-        return $"No precise row records found for '{keyword}' inside the '{tabName}' tab.";
+        return await Task.FromResult($"No precise row records found for '{keyword}' inside the '{tabName}' tab.");
     }
 }
 
